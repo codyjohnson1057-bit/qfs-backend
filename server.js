@@ -24,8 +24,11 @@ app.use(cors({
     'http://127.0.0.1:5500',
     'http://127.0.0.1:5501',
     'https://robinhood-alliance.web.app',
-    'https://rat-production-7ec5.up.railway.app',
-    '*'
+    'https://robinhood-alliance.firebaseapp.com',
+    'https://qfsqfsqfs.web.app',
+    'https://qfsqfsqfs.firebaseapp.com',
+    'https://web-production-8f747.up.railway.app',
+    'https://rat-production-7ec5.up.railway.app'
   ],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
