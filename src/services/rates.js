@@ -1,10 +1,11 @@
 /**
  * USD conversion rates for crypto / ETFs / metals.
- * Live crypto via CoinGecko + GeckoTerminal (QFS). ETF/metal use placeholders
- * when Yahoo/live feeds are unavailable — see FALLBACK_USD / ETF_FALLBACK / METAL_FALLBACK.
+ * QFS is fixed at $1 by site convention (matches frontend ra-api.js) — never use
+ * GeckoTerminal moonshot price for QFS. Other crypto via CoinGecko; ETF/metal use
+ * placeholders when Yahoo/live feeds are unavailable — see FALLBACK_USD / ETF_FALLBACK / METAL_FALLBACK.
  */
 const FALLBACK_USD = {
-  QFS: 0.00001623, BTC: 95000, ETH: 3500, USDT: 1, TRON: 0.25, TRX: 0.25,
+  QFS: 1, BTC: 95000, ETH: 3500, USDT: 1, TRON: 0.25, TRX: 0.25,
   BNB: 650, XRP: 2.2, XLM: 0.4, USD: 1
 };
 
@@ -22,31 +23,17 @@ const METAL_FALLBACK = {
 async function getUsdRates() {
   const base = { ...FALLBACK_USD, ...ETF_FALLBACK, ...METAL_FALLBACK };
   try {
-    const [cgRes, gtRes] = await Promise.all([
-      fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,tether,tron,binancecoin,ripple,stellar&vs_currencies=usd'
-      ),
-      fetch(
-        'https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/5rpEoZcrd5oJvEWcqHfzD8k4axJXhNW9fZ5putdsmoon'
-      )
-    ]);
+    const cgRes = await fetch(
+      'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,tether,tron,binancecoin,ripple,stellar&vs_currencies=usd'
+    );
 
     if (!cgRes.ok) throw new Error('CoinGecko rate fail');
     const p = await cgRes.json();
 
-    let qfsPrice = FALLBACK_USD.QFS;
-    if (gtRes.ok) {
-      const gt = await gtRes.json();
-      const priceStr =
-        gt?.data?.attributes?.token_prices?.[
-          '5rpEoZcrd5oJvEWcqHfzD8k4axJXhNW9fZ5putdsmoon'
-        ];
-      if (priceStr) qfsPrice = parseFloat(priceStr);
-    }
-
+    // QFS always $1 (site convention) — do not pull GeckoTerminal moonshot price
     return {
       ...base,
-      QFS: qfsPrice,
+      QFS: 1,
       BTC: p.bitcoin?.usd || FALLBACK_USD.BTC,
       ETH: p.ethereum?.usd || FALLBACK_USD.ETH,
       USDT: p.tether?.usd || 1,
@@ -58,7 +45,7 @@ async function getUsdRates() {
       USD: 1
     };
   } catch {
-    return { ...base };
+    return { ...base, QFS: 1 };
   }
 }
 
