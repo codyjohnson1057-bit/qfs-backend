@@ -42,7 +42,7 @@ router.post('/', authenticate, async (req, res) => {
     }
     const storedPin = String(userResult.rows[0].pin ?? '0000');
     if (String(pin) !== storedPin) {
-      return res.status(401).json({ error: 'Invalid pin' });
+      return res.status(400).json({ error: 'Invalid pin' });
     }
 
     const rates = await getUsdRates();
