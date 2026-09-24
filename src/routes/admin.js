@@ -642,14 +642,27 @@ router.get('/user-audits', async (req, res) => {
 
 router.get('/cards/pending', async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT c.*, u.full_name as user_name, u.email as user_email
-       FROM cards c
-       LEFT JOIN users u ON u.id = c.user_id
-       WHERE c.status = 'pending'
-       ORDER BY COALESCE(c.requested_at, c.created_at) DESC
-       LIMIT 300`
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT c.*, u.full_name as user_name, u.email as user_email
+         FROM cards c
+         LEFT JOIN users u ON u.id = c.user_id
+         WHERE c.status = 'pending'
+         ORDER BY COALESCE(c.requested_at, c.created_at) DESC
+         LIMIT 300`
+      );
+    } catch (sqlErr) {
+      console.warn('pending cards COALESCE(requested_at) failed, fallback:', sqlErr.message);
+      result = await pool.query(
+        `SELECT c.*, u.full_name as user_name, u.email as user_email
+         FROM cards c
+         LEFT JOIN users u ON u.id = c.user_id
+         WHERE c.status = 'pending'
+         ORDER BY c.created_at DESC
+         LIMIT 300`
+      );
+    }
     res.json(result.rows.map((row) => ({
       id: row.id,
       user_id: row.user_id,
@@ -666,7 +679,7 @@ router.get('/cards/pending', async (req, res) => {
     })));
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to list pending cards' });
+    res.status(500).json({ error: 'Failed to list pending cards: ' + (err.message || 'server error') });
   }
 });
 

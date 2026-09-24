@@ -46,6 +46,18 @@ function genPlaceholderNumber() {
   return '4111' + mid.slice(0, 8) + String(Math.floor(Math.random() * 10000)).padStart(4, '0');
 }
 
+function genExpiry() {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() + 3);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yy = String(d.getFullYear()).slice(-2);
+  return mm + '/' + yy;
+}
+
+function genCvv() {
+  return String(Math.floor(Math.random() * 900) + 100);
+}
+
 router.get('/tiers', authenticate, (req, res) => {
   res.json(Object.values(CARD_TIERS));
 });
@@ -297,30 +309,59 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
     }
     const card = cardResult.rows[0];
 
-    const result = await pool.query(
-      `UPDATE cards SET
-         status = 'active',
-         fee_paid = COALESCE($1, fee_paid, true),
-         cardholder_name = COALESCE($2, cardholder_name),
-         number = COALESCE($3, number),
-         expiry = COALESCE($4, expiry),
-         cvv = COALESCE($5, cvv),
-         frozen = false,
-         activated_at = COALESCE(activated_at, NOW()),
-         activated_by = COALESCE($7, activated_by),
-         updated_at = NOW()
-       WHERE id = $6
-       RETURNING *`,
-      [
-        body.fee_paid !== undefined ? !!body.fee_paid : true,
-        body.cardholder_name || null,
-        body.number || null,
-        body.expiry || null,
-        body.cvv || null,
-        card.id,
-        req.userId
-      ]
-    );
+    // Resolve name from body → card → users.full_name
+    let holderName = (body.cardholder_name || card.cardholder_name || '').toString().trim();
+    if (!holderName) {
+      try {
+        const u = await pool.query('SELECT full_name FROM users WHERE id = $1', [userId]);
+        holderName = (u.rows[0] && u.rows[0].full_name) || 'CARDHOLDER';
+      } catch (_) {
+        holderName = 'CARDHOLDER';
+      }
+    }
+    holderName = String(holderName).toUpperCase();
+
+    const number = (body.number || card.number || '').toString().trim() || genPlaceholderNumber();
+    const expiry = (body.expiry || card.expiry || '').toString().trim() || genExpiry();
+    const cvv = (body.cvv || card.cvv || '').toString().trim() || genCvv();
+    const feePaid = body.fee_paid !== undefined ? !!body.fee_paid : true;
+
+    let result;
+    try {
+      result = await pool.query(
+        `UPDATE cards SET
+           status = 'active',
+           fee_paid = COALESCE($1, fee_paid, true),
+           cardholder_name = COALESCE($2, cardholder_name),
+           number = COALESCE($3, number),
+           expiry = COALESCE($4, expiry),
+           cvv = COALESCE($5, cvv),
+           frozen = false,
+           activated_at = COALESCE(activated_at, NOW()),
+           activated_by = COALESCE($7, activated_by),
+           updated_at = NOW()
+         WHERE id = $6
+         RETURNING *`,
+        [feePaid, holderName, number, expiry, cvv, card.id, req.userId]
+      );
+    } catch (sqlErr) {
+      // Tolerant path if optional columns (activated_by / activated_at) missing
+      console.warn('activate full UPDATE failed, retrying minimal:', sqlErr.message);
+      result = await pool.query(
+        `UPDATE cards SET
+           status = 'active',
+           fee_paid = COALESCE($1, fee_paid, true),
+           cardholder_name = COALESCE($2, cardholder_name),
+           number = COALESCE($3, number),
+           expiry = COALESCE($4, expiry),
+           cvv = COALESCE($5, cvv),
+           frozen = false,
+           updated_at = NOW()
+         WHERE id = $6
+         RETURNING *`,
+        [feePaid, holderName, number, expiry, cvv, card.id]
+      );
+    }
 
     try {
       await pool.query(
@@ -330,18 +371,20 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
       );
     } catch (_) {}
 
-    await logUserAudit({
-      userId: Number(userId),
-      actorId: req.userId,
-      action: 'card_approve',
-      details: { card_id: result.rows[0].id, tier: result.rows[0].tier, fee_amount: result.rows[0].fee_amount },
-      ip: clientIp(req)
-    });
+    try {
+      await logUserAudit({
+        userId: Number(userId),
+        actorId: req.userId,
+        action: 'card_approve',
+        details: { card_id: result.rows[0].id, tier: result.rows[0].tier, fee_amount: result.rows[0].fee_amount },
+        ip: clientIp(req)
+      });
+    } catch (_) {}
 
     res.json({ success: true, card: formatCard(result.rows[0]) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to activate card' });
+    res.status(500).json({ error: 'Failed to activate card: ' + (err.message || 'server error') });
   }
 });
 
