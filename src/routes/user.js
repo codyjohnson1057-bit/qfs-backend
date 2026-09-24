@@ -163,9 +163,13 @@ router.post('/password', authenticate, async (req, res) => {
 router.post('/currency', authenticate, async (req, res) => {
   const { currency } = req.body;
   if (!currency) return res.status(400).json({ error: 'Currency required' });
+  const code = String(currency).trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(code)) {
+    return res.status(400).json({ error: 'Currency must be a 3-letter ISO code' });
+  }
   try {
-    await pool.query('UPDATE users SET preferred_currency = $1 WHERE id = $2', [currency, req.userId]);
-    res.json({ success: true });
+    await pool.query('UPDATE users SET preferred_currency = $1 WHERE id = $2', [code, req.userId]);
+    res.json({ success: true, preferred_currency: code });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update currency' });

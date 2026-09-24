@@ -10,6 +10,7 @@ const notificationsRoutes = require('./src/routes/notifications');
 const kycRoutes = require('./src/routes/kyc');
 const adminRoutes = require('./src/routes/admin');
 const cardsRoutes = require('./src/routes/cards');
+const { getFiatRates, FALLBACK_FIAT } = require('./src/services/rates');
 const paymentsRoutes = require('./src/routes/payments');
 const vaultsRoutes = require('./src/routes/vaults');
 const swapRoutes = require('./src/routes/swap');
@@ -54,6 +55,24 @@ app.use('/api/cards', cardsRoutes);
 app.use('/api/payments', paymentsRoutes);
 app.use('/api/vaults', vaultsRoutes);
 app.use('/api/swap', swapRoutes);
+
+app.get('/api/rates/fx', async (req, res) => {
+  try {
+    const force = String(req.query.refresh || '') === '1';
+    const data = await getFiatRates(force);
+    res.json({
+      base: 'USD',
+      rates: data.rates || FALLBACK_FIAT,
+      source: data.source,
+      fetched_at: data.fetchedAt ? new Date(data.fetchedAt).toISOString() : null,
+      cached: !!data.cached
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch FX rates', rates: FALLBACK_FIAT, source: 'fallback' });
+  }
+});
+
 
 // Nested admin features (mount before /api/admin catch-all for clarity)
 app.use('/api/admin/kyc', kycRoutes.adminRouter);

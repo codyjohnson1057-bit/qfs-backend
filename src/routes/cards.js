@@ -7,17 +7,7 @@ const { logUserAudit, logAdminAudit, clientIp, clientUa, safeCommit } = require(
 
 const router = express.Router();
 
-const CARD_TIERS = {
-  blue: { key: 'blue', label: 'Blue', fee: 500 },
-  green: { key: 'green', label: 'Green', fee: 850 },
-  silver: { key: 'silver', label: 'Silver', fee: 1500 },
-  gold: { key: 'gold', label: 'Gold', fee: 3000 }
-};
-
-function resolveTier(raw) {
-  const k = String(raw || '').trim().toLowerCase();
-  return CARD_TIERS[k] || null;
-}
+const { CARD_TIERS, resolveTier, tierDailyMax, clampDailyLimit } = require('../services/cardTiers');
 
 function formatCard(row) {
   return {
@@ -29,7 +19,7 @@ function formatCard(row) {
     expiry: row.expiry,
     cvv: row.cvv,
     network: row.network || 'visa',
-    daily_limit: row.daily_limit != null ? Number(row.daily_limit) : 2500,
+    daily_limit: row.daily_limit != null ? Number(row.daily_limit) : tierDailyMax(row.tier),
     online_enabled: row.online_enabled !== false,
     frozen: !!row.frozen,
     fee_paid: !!row.fee_paid,
@@ -153,10 +143,10 @@ async function handleCardRequest(req, res) {
          requested_at, created_at, updated_at
        ) VALUES (
          $1, 'pending', $2, $3, $4, NULL, NULL, 'visa',
-         2500, true, false, true, $5, $6,
+         $7, true, false, true, $5, $6,
          NOW(), NOW(), NOW()
        ) RETURNING *`,
-      [req.userId, tierInfo.key, name, genPlaceholderNumber(), feeUsd, payCurrency]
+      [req.userId, tierInfo.key, name, genPlaceholderNumber(), feeUsd, payCurrency, tierInfo.dailyLimit]
     );
     const row = insert.rows[0];
 
@@ -243,8 +233,9 @@ router.patch('/:id', authenticate, async (req, res) => {
       }
     }
     if (daily_limit !== undefined) {
+      const capped = clampDailyLimit(check.rows[0].tier, daily_limit);
       fields.push(`daily_limit = $${idx++}`);
-      values.push(Number(daily_limit));
+      values.push(capped);
     }
     if (online_enabled !== undefined) {
       fields.push(`online_enabled = $${idx++}`);
@@ -264,6 +255,97 @@ router.patch('/:id', authenticate, async (req, res) => {
     res.status(500).json({ error: 'Failed to update card' });
   }
 });
+
+
+/** Sum of completed card spend (USD) for this card today (UTC day). */
+async function cardSpentTodayUsd(clientOrPool, cardId, userId) {
+  const r = await clientOrPool.query(
+    `SELECT COALESCE(SUM(amount_usd), 0)::float AS spent
+     FROM transactions
+     WHERE type = 'card_spend'
+       AND status = 'completed'
+       AND sender_id = $1
+       AND description LIKE $2
+       AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
+    [userId, '%card_id:' + String(cardId) + '%']
+  );
+  return Number(r.rows[0]?.spent || 0);
+}
+
+/**
+ * POST /api/cards/:id/spend
+ * body: { amount_usd } — rejects when frozen, inactive, or over remaining daily limit.
+ */
+router.post('/:id/spend', authenticate, async (req, res) => {
+  const cardId = req.params.id;
+  const amountUsd = Number((req.body || {}).amount_usd ?? (req.body || {}).amount);
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    return res.status(400).json({ error: 'amount_usd must be a positive number' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const check = await client.query(
+      `SELECT * FROM cards WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+      [cardId, req.userId]
+    );
+    if (!check.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Card not found' });
+    }
+    const card = check.rows[0];
+    if (card.frozen || String(card.status).toLowerCase() === 'frozen') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Card is frozen' });
+    }
+    if (String(card.status).toLowerCase() !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Card is not active' });
+    }
+    const limit = clampDailyLimit(card.tier, card.daily_limit);
+    const spent = await cardSpentTodayUsd(client, card.id, req.userId);
+    const remaining = Math.max(0, limit - spent);
+    if (amountUsd > remaining + 1e-9) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Daily limit exceeded',
+        daily_limit: limit,
+        spent_today: spent,
+        remaining,
+        requested: amountUsd,
+        tier: card.tier
+      });
+    }
+    await client.query(
+      `INSERT INTO transactions
+         (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
+       VALUES ($1, $1, 'usd', $2, $2, 'card_spend', 'completed', $3, NOW(), NOW())`,
+      [req.userId, amountUsd, `Card spend card_id:${card.id} tier:${card.tier || ''}`]
+    );
+    await client.query('COMMIT');
+    await logUserAudit({
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'card_spend',
+      details: { card_id: Number(card.id), amount_usd: amountUsd, daily_limit: limit, spent_today: spent + amountUsd },
+      ip: clientIp(req)
+    });
+    res.json({
+      success: true,
+      amount_usd: amountUsd,
+      daily_limit: limit,
+      spent_today: spent + amountUsd,
+      remaining: remaining - amountUsd
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Spend failed' });
+  } finally {
+    client.release();
+  }
+});
+
 
 // Admin: list all pending cards (hub)
 router.get('/admin/pending', authenticate, isAdmin, async (req, res) => {
@@ -362,6 +444,20 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
          RETURNING *`,
         [feePaid, holderName, number, expiry, cvv, card.id]
       );
+    }
+
+    // Ensure activated card has tier-correct daily_limit (cap at tier max)
+    try {
+      const lim = clampDailyLimit(result.rows[0].tier, result.rows[0].daily_limit);
+      if (Number(result.rows[0].daily_limit) !== lim) {
+        const up = await pool.query(
+          `UPDATE cards SET daily_limit = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+          [lim, result.rows[0].id]
+        );
+        if (up.rows[0]) result = up;
+      }
+    } catch (limErr) {
+      console.warn('activate daily_limit sync skipped:', limErr.message);
     }
 
     await logAdminAudit({
@@ -543,6 +639,14 @@ adminCardsRouter.put('/', authenticate, isAdmin, async (req, res) => {
       pay_currency: body.pay_currency != null ? normalizeCurrencyKey(body.pay_currency) : undefined,
       fee_amount: body.fee_amount
     };
+    const existing = check.rows[0];
+    const nextTier = body.tier !== undefined ? body.tier : existing.tier;
+    if (map.daily_limit !== undefined) {
+      map.daily_limit = clampDailyLimit(nextTier, map.daily_limit);
+    } else if (body.tier !== undefined && body.daily_limit === undefined) {
+      // Tier change without explicit limit → default to new tier max
+      map.daily_limit = tierDailyMax(nextTier);
+    }
     for (const [col, val] of Object.entries(map)) {
       if (val !== undefined) {
         fields.push(`${col} = $${idx++}`);
