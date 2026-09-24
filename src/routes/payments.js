@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
-const { logUserAudit, clientIp } = require('../services/audits');
+const { logUserAudit, logAdminAudit, clientIp, clientUa } = require('../services/audits');
 
 const router = express.Router();
 
@@ -140,11 +140,14 @@ adminRouter.patch('/:id', authenticate, isAdmin, async (req, res) => {
       values
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Payment not found' });
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'payment_update', result.rows[0].user_id, JSON.stringify(req.body)]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'payment_update',
+      targetUserId: result.rows[0].user_id,
+      details: req.body || {},
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true, payment: formatPayment(result.rows[0]) });
   } catch (err) {
     console.error(err);

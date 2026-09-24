@@ -3,7 +3,7 @@ const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { getUsdRates, fromUsd, toUsd } = require('../services/rates');
 const { normalizeCurrencyKey, ensureWallet } = require('../services/wallets');
-const { logUserAudit, clientIp, safeCommit } = require('../services/audits');
+const { logUserAudit, logAdminAudit, clientIp, clientUa, safeCommit } = require('../services/audits');
 
 const router = express.Router();
 
@@ -364,13 +364,15 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
       );
     }
 
-    try {
-      await pool.query(
-        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [req.userId, 'card_activate', userId, JSON.stringify({ card_id: result.rows[0].id, tier: result.rows[0].tier })]
-      );
-    } catch (_) {}
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'card_activate',
+      targetUserId: userId,
+      details: { card_id: result.rows[0].id, tier: result.rows[0].tier },
+      ip: clientIp(req),
+      userAgent: clientUa(req),
+      mirrorUserAudit: false
+    })
 
     try {
       await logUserAudit({
@@ -463,18 +465,15 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
       [card.id, req.userId, body.reason || body.reject_reason || 'Rejected by admin']
     );
 
-    try {
-      await client.query(
-        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [
-          req.userId,
-          'card_reject',
-          userId,
-          JSON.stringify({ card_id: card.id, refunded, refund_currency: refundCurrency })
-        ]
-      );
-    } catch (_) {}
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'card_reject',
+      targetUserId: userId,
+      details: { card_id: card.id, refunded, refund_currency: refundCurrency },
+      ip: clientIp(req),
+      userAgent: clientUa(req),
+      mirrorUserAudit: false
+    })
 
     await safeCommit(client);
     await logUserAudit({
@@ -558,13 +557,14 @@ adminCardsRouter.put('/', authenticate, isAdmin, async (req, res) => {
        RETURNING *`,
       values
     );
-    try {
-      await pool.query(
-        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [req.userId, 'card_update', userId, JSON.stringify(body)]
-      );
-    } catch (_) {}
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'card_update',
+      targetUserId: userId,
+      details: body || {},
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    })
     res.json({ success: true, card: formatCard(result.rows[0]) });
   } catch (err) {
     console.error(err);

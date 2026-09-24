@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const pool = require('../db');
+const { logAdminAudit, clientIp, clientUa } = require('../services/audits');
 const { authenticate, isAdmin } = require('../middleware/auth');
 
 const upload = multer({
@@ -68,13 +69,14 @@ router.post(
         ]
       );
 
-      try {
-        await pool.query(
-          `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-           VALUES ($1, $2, $3, $4, NOW())`,
-          [req.userId, 'kyc_submit', req.userId, JSON.stringify({ kyc_id: result.rows[0].id })]
-        );
-      } catch (_) {}
+      await logAdminAudit({
+        adminId: req.userId,
+        action: 'kyc_submit',
+        targetUserId: req.userId,
+        details: { kyc_id: result.rows[0].id },
+        ip: clientIp(req),
+        userAgent: clientUa(req)
+      });
 
       res.json({
         success: true,

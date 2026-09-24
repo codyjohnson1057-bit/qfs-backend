@@ -15,6 +15,7 @@ const {
 } = require('../services/wallets');
 const { formatCard } = require('./cards');
 const { formatVault } = require('./vaults');
+const { logAdminAudit, clientIp, clientUa } = require('../services/audits');
 
 const router = express.Router();
 
@@ -97,11 +98,14 @@ router.post('/users/:id/ban', async (req, res) => {
       : (body.is_banned !== undefined ? body.is_banned : true));
   try {
     await pool.query('UPDATE users SET is_banned = $1 WHERE id = $2', [!!ban, id]);
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, ban ? 'ban_user' : 'unban_user', id, JSON.stringify({ ban: !!ban })]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: ban ? 'ban_user' : 'unban_user',
+      targetUserId: id,
+      details: { ban: !!ban },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true, is_banned: !!ban });
   } catch (err) {
     console.error(err);
@@ -121,11 +125,14 @@ router.post('/users/:id/suspend', async (req, res) => {
       'UPDATE users SET is_suspended = $1, suspension_reason = $2 WHERE id = $3',
       [!!suspend, suspend ? (reason || 'Suspended by admin') : null, id]
     );
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, suspend ? 'suspend_user' : 'unsuspend_user', id, JSON.stringify({ suspend: !!suspend, reason })]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: suspend ? 'suspend_user' : 'unsuspend_user',
+      targetUserId: id,
+      details: { suspend: !!suspend, reason },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true, is_suspended: !!suspend });
   } catch (err) {
     console.error(err);
@@ -137,11 +144,14 @@ router.delete('/users/:id', async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query('UPDATE users SET deleted_at = NOW() WHERE id = $1', [id]);
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'delete_user', id, JSON.stringify({})]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'delete_user',
+      targetUserId: id,
+      details: {},
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -156,11 +166,14 @@ router.post('/users/:id/verify', async (req, res) => {
   const verify = body.verify !== undefined ? body.verify : (body.verified !== undefined ? body.verified : true);
   try {
     await pool.query('UPDATE users SET is_verified = $1 WHERE id = $2', [!!verify, id]);
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, verify ? 'verify_user' : 'unverify_user', id, JSON.stringify({ verify })]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: verify ? 'verify_user' : 'unverify_user',
+      targetUserId: id,
+      details: { verify },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -178,11 +191,14 @@ router.post('/users/:id/wallet-link', async (req, res) => {
       'UPDATE users SET is_wallet_linked = $1 WHERE id = $2',
       [!!linked, id]
     );
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, linked ? 'wallet_link' : 'wallet_unlink', id, JSON.stringify({ linked: !!linked })]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: linked ? 'wallet_link' : 'wallet_unlink',
+      targetUserId: id,
+      details: { linked: !!linked },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true, is_wallet_linked: !!linked });
   } catch (err) {
     console.error(err);
@@ -249,20 +265,23 @@ router.post('/users/:id/balance', async (req, res) => {
       [senderId, receiverId, normalizeCurrencyKey(currency), numericAmount, amountUsd, txType, 'completed', desc]
     );
 
-    await client.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'balance_adjust', id, JSON.stringify({
+    await client.query('COMMIT');
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'balance_adjust',
+      targetUserId: id,
+      details: {
         currency: normalizeCurrencyKey(currency),
         amount: numericAmount,
         amount_usd: amountUsd,
         operation: op,
-        newBalance,
+        before_balance: currentBalance,
+        after_balance: newBalance,
         description: desc
-      })]
-    );
-
-    await client.query('COMMIT');
+      },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ success: true, newBalance, amount_usd: amountUsd });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -289,11 +308,14 @@ router.post('/impersonate/:id', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'impersonate', id, JSON.stringify({})]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'impersonate',
+      targetUserId: id,
+      details: {},
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.json({ token });
   } catch (err) {
     console.error(err);
@@ -324,11 +346,16 @@ router.post('/notifications', async (req, res) => {
       }
     }
 
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, details, created_at)
-       VALUES ($1, $2, $3, NOW())`,
-      [req.userId, 'send_notification', JSON.stringify({ userId, title, message })]
-    );
+    const notifTarget =
+      userId && userId !== 'all' && userId !== null ? Number(userId) : null;
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'send_notification',
+      targetUserId: Number.isFinite(notifTarget) ? notifTarget : null,
+      details: { userId, title, message },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
 
     res.json({ success: true });
   } catch (err) {
@@ -427,11 +454,14 @@ router.put('/users/:id', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'update_user', id, JSON.stringify(req.body)]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'update_user',
+      targetUserId: id,
+      details: req.body,
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
 
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
@@ -469,11 +499,14 @@ router.post('/users', async (req, res) => {
       [newUser.id, encrypted, iv.toString('hex')]
     );
     await client.query('COMMIT');
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'create_user', newUser.id, JSON.stringify({ full_name, email, phone, country, role })]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'create_user',
+      targetUserId: newUser.id,
+      details: { full_name, email, phone, country, role },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
     res.status(201).json({ success: true, user: newUser });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -548,11 +581,15 @@ router.put('/transactions/:id', async (req, res) => {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, details, created_at)
-       VALUES ($1, $2, $3, NOW())`,
-      [req.userId, 'update_transaction', JSON.stringify({ tx_id: id, ...req.body })]
-    );
+    const txRow = result.rows[0];
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'update_transaction',
+      targetUserId: txRow.receiver_id || txRow.sender_id || null,
+      details: { tx_id: id, ...req.body, before: { status: txRow.status, amount: txRow.amount, currency: txRow.currency } },
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
 
     res.json({ success: true, transaction: result.rows[0] });
   } catch (err) {
@@ -590,11 +627,14 @@ router.post('/transactions', async (req, res) => {
       [senderId, receiverId, type, status || 'completed', Number(amount), amountUsd, currency, description || null]
     );
 
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'create_transaction', user_id, JSON.stringify(req.body)]
-    );
+    await logAdminAudit({
+      adminId: req.userId,
+      action: 'create_transaction',
+      targetUserId: user_id,
+      details: req.body,
+      ip: clientIp(req),
+      userAgent: clientUa(req)
+    });
 
     res.status(201).json({ success: true, transaction: result.rows[0] });
   } catch (err) {
@@ -625,15 +665,32 @@ router.get('/audit', async (req, res) => {
 
 router.get('/user-audits', async (req, res) => {
   try {
-    const userId = req.query.user_id || req.query.userId || null;
+    const userIdRaw = req.query.user_id || req.query.userId || null;
+    const qRaw = (req.query.q || req.query.search || req.query.email || '').toString().trim();
     const params = [];
-    let where = '';
-    if (userId) {
-      params.push(Number(userId));
-      where = 'WHERE ua.user_id = $1';
+    const filters = [];
+
+    if (userIdRaw && String(userIdRaw).match(/^\d+$/)) {
+      params.push(Number(userIdRaw));
+      filters.push(`ua.user_id = $${params.length}`);
+    } else if (userIdRaw) {
+      params.push('%' + String(userIdRaw).toLowerCase() + '%');
+      filters.push(`(LOWER(COALESCE(u.email,'')) LIKE $${params.length} OR LOWER(COALESCE(u.full_name,'')) LIKE $${params.length})`);
     }
+
+    if (qRaw) {
+      if (qRaw.match(/^\d+$/)) {
+        params.push(Number(qRaw));
+        filters.push(`ua.user_id = $${params.length}`);
+      } else {
+        params.push('%' + qRaw.toLowerCase() + '%');
+        filters.push(`(LOWER(COALESCE(u.email,'')) LIKE $${params.length} OR LOWER(COALESCE(u.full_name,'')) LIKE $${params.length})`);
+      }
+    }
+
+    const where = filters.length ? ('WHERE ' + filters.join(' AND ')) : '';
     const sql =
-      `SELECT ua.id, ua.user_id, ua.actor_id, ua.action, ua.details, ua.ip, ua.created_at,
+      `SELECT ua.id, ua.user_id, ua.actor_id, ua.action, ua.details, ua.ip::text AS ip, ua.created_at,
               u.full_name as user_name, u.email as user_email,
               a.full_name as actor_name
        FROM user_audits ua
