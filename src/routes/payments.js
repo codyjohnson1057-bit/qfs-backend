@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
+const { logUserAudit, clientIp } = require('../services/audits');
 
 const router = express.Router();
 
@@ -57,6 +58,19 @@ router.post('/', authenticate, async (req, res) => {
       ]
     );
     const row = result.rows[0];
+    await logUserAudit({
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'payment_submit',
+      details: {
+        payment_id: row.id,
+        code: row.code,
+        type: row.type,
+        amount: Number(row.amount),
+        currency: row.currency
+      },
+      ip: clientIp(req)
+    });
     res.status(201).json({
       id: row.id,
       code: row.code,

@@ -1,6 +1,9 @@
 const express = require('express');
 const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
+const { getUsdRates, fromUsd } = require('../services/rates');
+const { normalizeCurrencyKey, ensureWallet } = require('../services/wallets');
+const { logUserAudit, clientIp } = require('../services/audits');
 
 const router = express.Router();
 
@@ -71,7 +74,6 @@ router.patch('/:id', authenticate, async (req, res) => {
     if (target !== undefined) { fields.push(`target = $${idx++}`); values.push(target == null ? null : Number(target)); }
     if (autosave !== undefined) { fields.push(`autosave = $${idx++}`); values.push(!!autosave); }
     if (autosave_amount !== undefined) { fields.push(`autosave_amount = $${idx++}`); values.push(Number(autosave_amount)); }
-    // Users typically don't set balance via PATCH; allow only if provided (admin-like)
     if (balance !== undefined) { fields.push(`balance = $${idx++}`); values.push(Number(balance)); }
     if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
     fields.push('updated_at = NOW()');
@@ -88,13 +90,16 @@ router.patch('/:id', authenticate, async (req, res) => {
   }
 });
 
-
-// Debit main wallet (qfs @ $1) and credit vault. Rejects on insufficient funds.
+// Debit chosen wallet by USD-equivalent and credit vault balance (USD terms).
 router.post('/:id/deposit', authenticate, async (req, res) => {
-  const amount = Number((req.body || {}).amount);
-  if (!amount || !(amount > 0)) {
-    return res.status(400).json({ error: 'Positive amount required' });
+  const body = req.body || {};
+  const amountUsd = Number(body.amount);
+  const currencyKey = normalizeCurrencyKey(body.currency || body.from || 'qfs') || 'qfs';
+
+  if (!amountUsd || !(amountUsd > 0) || Number.isNaN(amountUsd)) {
+    return res.status(400).json({ error: 'Positive amount (USD) required' });
   }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -106,41 +111,87 @@ router.post('/:id/deposit', authenticate, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Vault not found' });
     }
-    const { ensureWallet } = require('../services/wallets');
-    // Main bank balance tracked as qfs (USD-pegged on this platform)
-    const wallet = await ensureWallet(client, req.userId, 'qfs');
-    const bal = Number(wallet.balance || 0);
-    if (bal < amount) {
+
+    const rates = await getUsdRates();
+    const debitUnits = fromUsd(amountUsd, currencyKey, rates);
+    if (!debitUnits || debitUnits <= 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Insufficient funds', balance: bal, required: amount });
+      return res.status(400).json({
+        error: `Unable to price asset "${currencyKey}" for vault deposit`
+      });
     }
-    await client.query('UPDATE wallets SET balance = balance - $1 WHERE id = $2', [amount, wallet.id]);
+
+    const wallet = await ensureWallet(client, req.userId, currencyKey);
+    const bal = Number(wallet.balance || 0);
+    if (bal + 1e-12 < debitUnits) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient funds in ${currencyKey.toUpperCase()}: have ${bal}, need ${debitUnits} (~$${amountUsd} USD)`,
+        balance: bal,
+        required: debitUnits,
+        required_usd: amountUsd,
+        currency: currencyKey
+      });
+    }
+
+    await client.query('UPDATE wallets SET balance = balance - $1 WHERE id = $2', [
+      debitUnits,
+      wallet.id
+    ]);
     const updated = await client.query(
       `UPDATE vaults SET balance = COALESCE(balance,0) + $1, updated_at = NOW()
        WHERE id = $2 AND user_id = $3 RETURNING *`,
-      [amount, req.params.id, req.userId]
+      [amountUsd, req.params.id, req.userId]
     );
+
+    const vaultName = vaultRes.rows[0].name || req.params.id;
     try {
       await client.query(
         `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
-         VALUES ($1, $1, 'qfs', $2, $2, 'vault_deposit', 'completed', $3, NOW(), NOW())`,
-        [req.userId, amount, 'Vault deposit: ' + (vaultRes.rows[0].name || req.params.id)]
+         VALUES ($1, $1, $2, $3, $4, 'vault_deposit', 'completed', $5, NOW(), NOW())`,
+        [
+          req.userId,
+          currencyKey,
+          debitUnits,
+          amountUsd,
+          `Vault deposit: ${vaultName} (${currencyKey.toUpperCase()} → $${amountUsd})`
+        ]
       );
     } catch (txErr) {
-      // non-fatal if transactions shape differs
       console.warn('vault deposit tx log skipped', txErr.message);
     }
+
+    await logUserAudit({
+      client,
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'vault_deposit',
+      details: {
+        vault_id: Number(req.params.id),
+        vault_name: vaultName,
+        amount_usd: amountUsd,
+        currency: currencyKey,
+        debited: debitUnits
+      },
+      ip: clientIp(req)
+    });
+
     await client.query('COMMIT');
-    res.json({ success: true, vault: formatVault(updated.rows[0]), debited: amount, currency: 'qfs' });
+    res.json({
+      success: true,
+      vault: formatVault(updated.rows[0]),
+      debited: debitUnits,
+      amount_usd: amountUsd,
+      currency: currencyKey
+    });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     console.error(err);
-    res.status(500).json({ error: 'Failed to deposit to vault' });
+    res.status(500).json({ error: 'Failed to deposit to vault: ' + (err.message || 'server error') });
   } finally {
     client.release();
   }
 });
-
 
 const adminUserVaultsRouter = express.Router({ mergeParams: true });
 
@@ -156,7 +207,6 @@ adminUserVaultsRouter.get('/', authenticate, isAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch vaults' });
   }
 });
-
 
 adminUserVaultsRouter.patch('/:vaultId', authenticate, isAdmin, async (req, res) => {
   const { name, target, balance, autosave, autosave_amount } = req.body || {};

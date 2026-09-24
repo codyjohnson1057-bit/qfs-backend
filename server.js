@@ -61,6 +61,7 @@ app.use('/api/admin/payments', paymentsRoutes.adminRouter);
 app.use('/api/admin/swaps', swapRoutes.adminRouter);
 app.use('/api/admin/users/:id/vaults', vaultsRoutes.adminUserVaultsRouter);
 app.use('/api/admin/users/:id/cards/activate', cardsRoutes.adminActivateRouter);
+app.use('/api/admin/users/:id/cards/reject', cardsRoutes.adminRejectRouter);
 app.use('/api/admin/users/:id/cards', cardsRoutes.adminCardsRouter);
 
 app.use('/api/admin', adminRoutes);

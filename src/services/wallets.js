@@ -10,7 +10,11 @@ const DEFAULT_CURRENCIES = [
 ];
 
 function normalizeCurrencyKey(currency) {
-  return String(currency || '').trim().toLowerCase();
+  let key = String(currency || '').trim().toLowerCase();
+  // Frontend legacy select values used "btc_wallet" etc.
+  if (key.endsWith('_wallet')) key = key.slice(0, -7);
+  if (key === 'usdt_trc' || key === 'usdt-trc20' || key === 'usdt_trc20') key = 'usdt';
+  return key;
 }
 
 function formatWalletRows(rows) {

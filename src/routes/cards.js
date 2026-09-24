@@ -1,14 +1,29 @@
 const express = require('express');
 const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
+const { getUsdRates, fromUsd, toUsd } = require('../services/rates');
+const { normalizeCurrencyKey, ensureWallet } = require('../services/wallets');
+const { logUserAudit, clientIp } = require('../services/audits');
 
 const router = express.Router();
-const CARD_FEE = 350;
+
+const CARD_TIERS = {
+  blue: { key: 'blue', label: 'Blue', fee: 500 },
+  green: { key: 'green', label: 'Green', fee: 850 },
+  silver: { key: 'silver', label: 'Silver', fee: 1500 },
+  gold: { key: 'gold', label: 'Gold', fee: 3000 }
+};
+
+function resolveTier(raw) {
+  const k = String(raw || '').trim().toLowerCase();
+  return CARD_TIERS[k] || null;
+}
 
 function formatCard(row) {
   return {
     id: row.id,
     status: row.status,
+    tier: row.tier || null,
     cardholder_name: row.cardholder_name,
     number: row.number,
     expiry: row.expiry,
@@ -18,17 +33,22 @@ function formatCard(row) {
     online_enabled: row.online_enabled !== false,
     frozen: !!row.frozen,
     fee_paid: !!row.fee_paid,
-    fee_amount: Number(row.fee_amount != null ? row.fee_amount : CARD_FEE),
+    fee_amount: Number(row.fee_amount != null ? row.fee_amount : 0),
+    pay_currency: row.pay_currency ? normalizeCurrencyKey(row.pay_currency) : null,
+    requested_at: row.requested_at || row.created_at,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
 }
 
 function genPlaceholderNumber() {
-  // Not a real PAN — placeholder until admin sets details on activate
   const mid = String(Math.floor(Math.random() * 1e10)).padStart(10, '0');
   return '4111' + mid.slice(0, 8) + String(Math.floor(Math.random() * 10000)).padStart(4, '0');
 }
+
+router.get('/tiers', authenticate, (req, res) => {
+  res.json(Object.values(CARD_TIERS));
+});
 
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -43,51 +63,145 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
-async function createPendingCard(userId) {
-  // Look up name for cardholder placeholder
-  const user = await pool.query('SELECT full_name FROM users WHERE id = $1', [userId]);
-  const name = (user.rows[0]?.full_name || 'CARDHOLDER').toUpperCase();
-  const result = await pool.query(
-    `INSERT INTO cards (
-       user_id, status, cardholder_name, number, expiry, cvv, network,
-       daily_limit, online_enabled, frozen, fee_paid, fee_amount, created_at, updated_at
-     ) VALUES ($1, 'pending', $2, $3, NULL, NULL, 'visa', 2500, true, false, false, $4, NOW(), NOW())
-     RETURNING *`,
-    [userId, name, genPlaceholderNumber(), CARD_FEE]
-  );
-  return result.rows[0];
-}
-
 async function handleCardRequest(req, res) {
+  const body = req.body || {};
+  const tierInfo = resolveTier(body.tier || body.card_tier);
+  if (!tierInfo) {
+    return res.status(400).json({
+      error: 'tier required (blue|green|silver|gold)',
+      tiers: Object.values(CARD_TIERS)
+    });
+  }
+  const payCurrency = normalizeCurrencyKey(body.currency || body.pay_currency || body.from || 'qfs') || 'qfs';
+  const feeUsd = tierInfo.fee;
+
+  const client = await pool.connect();
   try {
-    const pending = await pool.query(
-      `SELECT id FROM cards WHERE user_id = $1 AND status = 'pending' LIMIT 1`,
+    await client.query('BEGIN');
+
+    const blocking = await client.query(
+      `SELECT id, status FROM cards
+       WHERE user_id = $1 AND status IN ('pending', 'active', 'frozen')
+       ORDER BY created_at DESC LIMIT 1
+       FOR UPDATE`,
       [req.userId]
     );
-    if (pending.rows.length) {
-      return res.json({
-        id: pending.rows[0].id,
-        status: 'pending',
-        fee: CARD_FEE,
-        message: 'Card request already pending — awaiting admin activation'
+    if (blocking.rows.length) {
+      const st = blocking.rows[0].status;
+      await client.query('ROLLBACK');
+      if (st === 'pending') {
+        return res.status(409).json({
+          error: 'Card request already pending — awaiting admin activation',
+          id: blocking.rows[0].id,
+          status: 'pending'
+        });
+      }
+      return res.status(409).json({
+        error: 'You already have an active card',
+        id: blocking.rows[0].id,
+        status: st
       });
     }
-    const row = await createPendingCard(req.userId);
-    // fee_paid=false; do NOT auto-debit $350
+
+    const rates = await getUsdRates();
+    const debitUnits = fromUsd(feeUsd, payCurrency, rates);
+    if (!debitUnits || debitUnits <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Unable to price asset "${payCurrency}" for card fee` });
+    }
+
+    const wallet = await ensureWallet(client, req.userId, payCurrency);
+    const bal = Number(wallet.balance || 0);
+    const balUsd = toUsd(bal, payCurrency, rates);
+    if (bal + 1e-12 < debitUnits) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Insufficient funds for ${tierInfo.label} card ($${feeUsd}). ${payCurrency.toUpperCase()} balance ≈ $${balUsd.toFixed(2)}, need $${feeUsd}`,
+        balance: bal,
+        balance_usd: balUsd,
+        required: debitUnits,
+        required_usd: feeUsd,
+        currency: payCurrency,
+        tier: tierInfo.key
+      });
+    }
+
+    await client.query('UPDATE wallets SET balance = balance - $1 WHERE id = $2', [
+      debitUnits,
+      wallet.id
+    ]);
+
+    const user = await client.query('SELECT full_name, email FROM users WHERE id = $1', [req.userId]);
+    const name = (user.rows[0]?.full_name || 'CARDHOLDER').toUpperCase();
+
+    const insert = await client.query(
+      `INSERT INTO cards (
+         user_id, status, tier, cardholder_name, number, expiry, cvv, network,
+         daily_limit, online_enabled, frozen, fee_paid, fee_amount, pay_currency,
+         requested_at, created_at, updated_at
+       ) VALUES (
+         $1, 'pending', $2, $3, $4, NULL, NULL, 'visa',
+         2500, true, false, true, $5, $6,
+         NOW(), NOW(), NOW()
+       ) RETURNING *`,
+      [req.userId, tierInfo.key, name, genPlaceholderNumber(), feeUsd, payCurrency]
+    );
+    const row = insert.rows[0];
+
+    try {
+      await client.query(
+        `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
+         VALUES ($1, $1, $2, $3, $4, 'card_fee', 'completed', $5, NOW(), NOW())`,
+        [
+          req.userId,
+          payCurrency,
+          debitUnits,
+          feeUsd,
+          `Card fee ${tierInfo.label} ($${feeUsd}) paid from ${payCurrency.toUpperCase()}`
+        ]
+      );
+    } catch (txErr) {
+      console.warn('card fee tx log skipped', txErr.message);
+    }
+
+    await logUserAudit({
+      client,
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'card_request',
+      details: {
+        card_id: row.id,
+        tier: tierInfo.key,
+        fee_usd: feeUsd,
+        pay_currency: payCurrency,
+        debited: debitUnits,
+        user_name: user.rows[0]?.full_name || null,
+        user_email: user.rows[0]?.email || null
+      },
+      ip: clientIp(req)
+    });
+
+    await client.query('COMMIT');
     res.status(201).json({
       id: row.id,
       status: 'pending',
-      fee: CARD_FEE,
-      message: 'Card request submitted — awaiting admin activation'
+      tier: tierInfo.key,
+      fee: feeUsd,
+      fee_paid: true,
+      pay_currency: payCurrency,
+      debited: debitUnits,
+      message: `${tierInfo.label} card request submitted ($${feeUsd} fee debited). Awaiting admin activation.`
     });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error(err);
-    res.status(500).json({ error: 'Failed to request card' });
+    res.status(500).json({ error: 'Failed to request card: ' + (err.message || 'server error') });
+  } finally {
+    client.release();
   }
 }
 
 router.post('/request', authenticate, handleCardRequest);
-// Optional create alias
 router.post('/', authenticate, handleCardRequest);
 
 router.patch('/:id', authenticate, async (req, res) => {
@@ -98,6 +212,10 @@ router.patch('/:id', authenticate, async (req, res) => {
       [req.params.id, req.userId]
     );
     if (!check.rows.length) return res.status(404).json({ error: 'Card not found' });
+    if (String(check.rows[0].status).toLowerCase() !== 'active' &&
+        String(check.rows[0].status).toLowerCase() !== 'frozen') {
+      return res.status(400).json({ error: 'Card is not active yet' });
+    }
 
     const fields = [];
     const values = [];
@@ -105,7 +223,6 @@ router.patch('/:id', authenticate, async (req, res) => {
     if (frozen !== undefined) {
       fields.push(`frozen = $${idx++}`);
       values.push(!!frozen);
-      // Keep status in sync when freezing/unfreezing an active card
       if (frozen) {
         fields.push(`status = CASE WHEN status = 'active' THEN 'frozen' ELSE status END`);
       } else {
@@ -135,7 +252,29 @@ router.patch('/:id', authenticate, async (req, res) => {
   }
 });
 
-// Admin: activate pending card for user
+// Admin: list all pending cards (hub)
+router.get('/admin/pending', authenticate, isAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.*, u.full_name as user_name, u.email as user_email
+       FROM cards c
+       LEFT JOIN users u ON u.id = c.user_id
+       WHERE c.status = 'pending'
+       ORDER BY COALESCE(c.requested_at, c.created_at) DESC
+       LIMIT 300`
+    );
+    res.json(result.rows.map((row) => ({
+      ...formatCard(row),
+      user_id: row.user_id,
+      user_name: row.user_name,
+      user_email: row.user_email
+    })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to list pending cards' });
+  }
+});
+
 const adminActivateRouter = express.Router({ mergeParams: true });
 
 adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
@@ -148,23 +287,20 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
       [userId]
     );
     if (!cardResult.rows.length) {
-      // Activate latest card or create one
       cardResult = await pool.query(
         `SELECT * FROM cards WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
         [userId]
       );
     }
-    let card;
     if (!cardResult.rows.length) {
-      card = await createPendingCard(userId);
-    } else {
-      card = cardResult.rows[0];
+      return res.status(404).json({ error: 'No card found for user' });
     }
+    const card = cardResult.rows[0];
 
     const result = await pool.query(
       `UPDATE cards SET
          status = 'active',
-         fee_paid = COALESCE($1, true),
+         fee_paid = COALESCE($1, fee_paid, true),
          cardholder_name = COALESCE($2, cardholder_name),
          number = COALESCE($3, number),
          expiry = COALESCE($4, expiry),
@@ -186,16 +322,141 @@ adminActivateRouter.post('/', authenticate, isAdmin, async (req, res) => {
       ]
     );
 
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'card_activate', userId, JSON.stringify({ card_id: result.rows[0].id })]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [req.userId, 'card_activate', userId, JSON.stringify({ card_id: result.rows[0].id, tier: result.rows[0].tier })]
+      );
+    } catch (_) {}
+
+    await logUserAudit({
+      userId: Number(userId),
+      actorId: req.userId,
+      action: 'card_approve',
+      details: { card_id: result.rows[0].id, tier: result.rows[0].tier, fee_amount: result.rows[0].fee_amount },
+      ip: clientIp(req)
+    });
 
     res.json({ success: true, card: formatCard(result.rows[0]) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to activate card' });
+  }
+});
+
+// Admin reject + refund fee
+const adminRejectRouter = express.Router({ mergeParams: true });
+
+adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
+  const userId = req.params.id;
+  const body = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let cardResult = await client.query(
+      `SELECT * FROM cards WHERE user_id = $1 AND status = 'pending'
+       ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+      [userId]
+    );
+    if (!cardResult.rows.length && body.card_id) {
+      cardResult = await client.query(
+        `SELECT * FROM cards WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [body.card_id, userId]
+      );
+    }
+    if (!cardResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No pending card to reject' });
+    }
+    const card = cardResult.rows[0];
+    let refunded = 0;
+    let refundCurrency = card.pay_currency || 'qfs';
+
+    if (card.fee_paid && Number(card.fee_amount) > 0) {
+      const rates = await getUsdRates();
+      const curr = normalizeCurrencyKey(card.pay_currency || 'qfs') || 'qfs';
+      refundCurrency = curr;
+      const units = fromUsd(Number(card.fee_amount), curr, rates);
+      if (units > 0) {
+        const wallet = await ensureWallet(client, userId, curr);
+        await client.query('UPDATE wallets SET balance = balance + $1 WHERE id = $2', [
+          units,
+          wallet.id
+        ]);
+        refunded = units;
+        try {
+          await client.query(
+            `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
+             VALUES ($1, $1, $2, $3, $4, 'card_fee_refund', 'completed', $5, NOW(), NOW())`,
+            [
+              userId,
+              curr,
+              units,
+              Number(card.fee_amount),
+              `Card fee refund (rejected ${card.tier || 'card'})`
+            ]
+          );
+        } catch (txErr) {
+          console.warn('card refund tx skipped', txErr.message);
+        }
+      }
+    }
+
+    const updated = await client.query(
+      `UPDATE cards SET
+         status = 'rejected',
+         fee_paid = false,
+         rejected_at = NOW(),
+         rejected_by = $2,
+         reject_reason = $3,
+         updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [card.id, req.userId, body.reason || body.reject_reason || 'Rejected by admin']
+    );
+
+    try {
+      await client.query(
+        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [
+          req.userId,
+          'card_reject',
+          userId,
+          JSON.stringify({ card_id: card.id, refunded, refund_currency: refundCurrency })
+        ]
+      );
+    } catch (_) {}
+
+    await logUserAudit({
+      client,
+      userId: Number(userId),
+      actorId: req.userId,
+      action: 'card_reject',
+      details: {
+        card_id: card.id,
+        tier: card.tier,
+        refunded,
+        refund_currency: refundCurrency,
+        reason: body.reason || null
+      },
+      ip: clientIp(req)
+    });
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      card: formatCard(updated.rows[0]),
+      refunded,
+      refund_currency: refundCurrency
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error(err);
+    res.status(500).json({ error: 'Failed to reject card' });
+  } finally {
+    client.release();
   }
 });
 
@@ -207,7 +468,6 @@ adminCardsRouter.put('/', authenticate, isAdmin, async (req, res) => {
   let cardId = body.card_id || body.id;
   try {
     if (!cardId) {
-      // SuperRight save often omits card_id — target latest card for user
       const latest = await pool.query(
         `SELECT id FROM cards WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
         [userId]
@@ -234,7 +494,10 @@ adminCardsRouter.put('/', authenticate, isAdmin, async (req, res) => {
       daily_limit: body.daily_limit,
       online_enabled: body.online_enabled,
       fee_paid: body.fee_paid,
-      network: body.network
+      network: body.network,
+      tier: body.tier,
+      pay_currency: body.pay_currency != null ? normalizeCurrencyKey(body.pay_currency) : undefined,
+      fee_amount: body.fee_amount
     };
     for (const [col, val] of Object.entries(map)) {
       if (val !== undefined) {
@@ -250,11 +513,13 @@ adminCardsRouter.put('/', authenticate, isAdmin, async (req, res) => {
        RETURNING *`,
       values
     );
-    await pool.query(
-      `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, 'card_update', userId, JSON.stringify(body)]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [req.userId, 'card_update', userId, JSON.stringify(body)]
+      );
+    } catch (_) {}
     res.json({ success: true, card: formatCard(result.rows[0]) });
   } catch (err) {
     console.error(err);
@@ -277,5 +542,7 @@ adminCardsRouter.get('/', authenticate, isAdmin, async (req, res) => {
 
 module.exports = router;
 module.exports.adminActivateRouter = adminActivateRouter;
+module.exports.adminRejectRouter = adminRejectRouter;
 module.exports.adminCardsRouter = adminCardsRouter;
 module.exports.formatCard = formatCard;
+module.exports.CARD_TIERS = CARD_TIERS;

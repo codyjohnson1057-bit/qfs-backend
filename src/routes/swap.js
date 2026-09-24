@@ -8,6 +8,7 @@ const {
   findWallet,
   ensureWallet
 } = require('../services/wallets');
+const { logUserAudit, clientIp } = require('../services/audits');
 
 const router = express.Router();
 
@@ -59,7 +60,7 @@ router.post('/', authenticate, async (req, res) => {
     const fromBal = Number(fromWallet.balance);
     if (fromBal + 1e-12 < fromDebited) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Insufficient balance' });
+      return res.status(400).json({ error: `Insufficient funds in ${fromKey.toUpperCase()}: have ${fromBal}, need ${fromDebited}`, balance: fromBal, required: fromDebited, currency: fromKey });
     }
 
     const newFrom = fromBal - fromDebited;
@@ -99,6 +100,22 @@ router.post('/', authenticate, async (req, res) => {
         `Swap ${fromKey} → ${toKey}`
       ]
     );
+
+    await logUserAudit({
+      client,
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'swap',
+      details: {
+        from: fromKey,
+        to: toKey,
+        amount_usd: amountUsd,
+        from_debited: fromDebited,
+        to_credited: toCredited,
+        swap_id: swapResult.rows[0].id
+      },
+      ip: clientIp(req)
+    });
 
     await client.query('COMMIT');
 
