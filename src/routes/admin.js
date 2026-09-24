@@ -90,15 +90,19 @@ router.get('/users/:id', async (req, res) => {
 
 router.post('/users/:id/ban', async (req, res) => {
   const { id } = req.params;
-  const { ban } = req.body;
+  const body = req.body || {};
+  // Accept ban | banned | is_banned (frontend sends { ban })
+  const ban = body.ban !== undefined ? body.ban
+    : (body.banned !== undefined ? body.banned
+      : (body.is_banned !== undefined ? body.is_banned : true));
   try {
     await pool.query('UPDATE users SET is_banned = $1 WHERE id = $2', [!!ban, id]);
     await pool.query(
       `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
        VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, ban ? 'ban_user' : 'unban_user', id, JSON.stringify({ ban })]
+      [req.userId, ban ? 'ban_user' : 'unban_user', id, JSON.stringify({ ban: !!ban })]
     );
-    res.json({ success: true });
+    res.json({ success: true, is_banned: !!ban });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update ban status' });
@@ -107,7 +111,11 @@ router.post('/users/:id/ban', async (req, res) => {
 
 router.post('/users/:id/suspend', async (req, res) => {
   const { id } = req.params;
-  const { suspend, reason } = req.body;
+  const body = req.body || {};
+  const suspend = body.suspend !== undefined ? body.suspend
+    : (body.suspended !== undefined ? body.suspended
+      : (body.is_suspended !== undefined ? body.is_suspended : true));
+  const reason = body.reason;
   try {
     await pool.query(
       'UPDATE users SET is_suspended = $1, suspension_reason = $2 WHERE id = $3',
@@ -116,9 +124,9 @@ router.post('/users/:id/suspend', async (req, res) => {
     await pool.query(
       `INSERT INTO admin_audit_logs (admin_id, action, target_user_id, details, created_at)
        VALUES ($1, $2, $3, $4, NOW())`,
-      [req.userId, suspend ? 'suspend_user' : 'unsuspend_user', id, JSON.stringify({ suspend, reason })]
+      [req.userId, suspend ? 'suspend_user' : 'unsuspend_user', id, JSON.stringify({ suspend: !!suspend, reason })]
     );
-    res.json({ success: true });
+    res.json({ success: true, is_suspended: !!suspend });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update suspend status' });
@@ -162,7 +170,9 @@ router.post('/users/:id/verify', async (req, res) => {
 
 router.post('/users/:id/wallet-link', async (req, res) => {
   const { id } = req.params;
-  const { linked } = req.body;
+  const body = req.body || {};
+  const linked = body.linked !== undefined ? body.linked
+    : (body.is_wallet_linked !== undefined ? body.is_wallet_linked : true);
   try {
     await pool.query(
       'UPDATE users SET is_wallet_linked = $1 WHERE id = $2',
