@@ -194,6 +194,78 @@ router.post('/:id/deposit', authenticate, async (req, res) => {
   }
 });
 
+
+// Delete vault. Refunds remaining USD balance into the user's QFS wallet (QFS=$1).
+router.delete('/:id', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const vaultRes = await client.query(
+      'SELECT * FROM vaults WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [req.params.id, req.userId]
+    );
+    if (!vaultRes.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Vault not found' });
+    }
+    const vault = vaultRes.rows[0];
+    const balUsd = Number(vault.balance || 0);
+    let refunded = 0;
+
+    if (balUsd > 0) {
+      // Vault balances are stored in USD terms; credit QFS 1:1
+      const wallet = await ensureWallet(client, req.userId, 'qfs');
+      await client.query('UPDATE wallets SET balance = COALESCE(balance,0) + $1 WHERE id = $2', [
+        balUsd,
+        wallet.id
+      ]);
+      refunded = balUsd;
+      await client.query('SAVEPOINT vault_del_tx');
+      try {
+        await client.query(
+          `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
+           VALUES ($1, $1, 'qfs', $2, $3, 'vault_withdraw', 'completed', $4, NOW(), NOW())`,
+          [
+            req.userId,
+            balUsd,
+            balUsd,
+            `Vault deleted — refund: ${vault.name || req.params.id}`
+          ]
+        );
+        await client.query('RELEASE SAVEPOINT vault_del_tx');
+      } catch (txErr) {
+        await client.query('ROLLBACK TO SAVEPOINT vault_del_tx');
+        console.warn('vault delete tx log skipped', txErr.message);
+      }
+    }
+
+    await client.query('DELETE FROM vaults WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      req.userId
+    ]);
+    await safeCommit(client);
+    await logUserAudit({
+      userId: req.userId,
+      actorId: req.userId,
+      action: 'vault_delete',
+      details: {
+        vault_id: Number(req.params.id),
+        vault_name: vault.name,
+        refunded_usd: refunded,
+        refund_currency: 'qfs'
+      },
+      ip: clientIp(req)
+    });
+    res.json({ success: true, refunded_usd: refunded, currency: 'qfs' });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete vault: ' + (err.message || 'server error') });
+  } finally {
+    client.release();
+  }
+});
+
 const adminUserVaultsRouter = express.Router({ mergeParams: true });
 
 adminUserVaultsRouter.get('/', authenticate, isAdmin, async (req, res) => {
