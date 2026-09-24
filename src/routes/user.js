@@ -30,21 +30,32 @@ router.get('/', authenticate, async (req, res) => {
     let income = 0;
     let expenses = 0;
 
+    // Classify by Neon tx type + direction. Include swap / vault / card / payment
+    // so dashboard Expenses is not stuck at $0 after admin-set values get overwritten.
+    const IN_TYPES = new Set(['receive', 'deposit', 'admin_adjust', 'swap', 'vault_withdraw', 'card_fee_refund']);
+    const OUT_TYPES = new Set(['send', 'withdrawal', 'admin_adjust', 'swap', 'vault_deposit', 'card_fee', 'payment']);
+
     for (const tx of txResult.rows) {
       let usd = Number(tx.amount_usd);
       if (!usd || isNaN(usd) || usd === 0) {
         usd = toUsd(tx.amount, tx.currency, rates);
       }
+      if (!usd || isNaN(usd)) usd = 0;
+      usd = Math.abs(usd);
 
-      const isIn =
-        String(tx.receiver_id) === String(req.userId) &&
-        ['receive', 'deposit', 'admin_adjust'].includes(tx.type);
-      const isOut =
-        String(tx.sender_id) === String(req.userId) &&
-        ['send', 'withdrawal', 'admin_adjust'].includes(tx.type);
+      const typ = String(tx.type || '').toLowerCase();
+      const isReceiver = String(tx.receiver_id) === String(req.userId);
+      const isSender = String(tx.sender_id) === String(req.userId);
 
-      if (isIn) income += usd;
-      if (isOut) expenses += usd;
+      const isIn = isReceiver && IN_TYPES.has(typ) && !(typ === 'admin_adjust' && isSender && !isReceiver);
+      const isOut = isSender && OUT_TYPES.has(typ) && !(typ === 'admin_adjust' && isReceiver && !isSender);
+
+      // admin_adjust credit: receiver only; debit: sender only (already covered)
+      if (isIn && !isOut) income += usd;
+      else if (isOut && !isIn) expenses += usd;
+      else if (isIn && isOut) {
+        // self-transfer edge — ignore
+      }
     }
 
     await pool.query(
