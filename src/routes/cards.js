@@ -3,7 +3,7 @@ const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { getUsdRates, fromUsd, toUsd } = require('../services/rates');
 const { normalizeCurrencyKey, ensureWallet } = require('../services/wallets');
-const { logUserAudit, clientIp } = require('../services/audits');
+const { logUserAudit, clientIp, safeCommit } = require('../services/audits');
 
 const router = express.Router();
 
@@ -160,6 +160,7 @@ async function handleCardRequest(req, res) {
     );
     const row = insert.rows[0];
 
+    await client.query('SAVEPOINT card_fee_tx');
     try {
       await client.query(
         `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
@@ -172,12 +173,14 @@ async function handleCardRequest(req, res) {
           `Card fee ${tierInfo.label} ($${feeUsd}) paid from ${payCurrency.toUpperCase()}`
         ]
       );
+      await client.query('RELEASE SAVEPOINT card_fee_tx');
     } catch (txErr) {
+      await client.query('ROLLBACK TO SAVEPOINT card_fee_tx');
       console.warn('card fee tx log skipped', txErr.message);
     }
 
+    await safeCommit(client);
     await logUserAudit({
-      client,
       userId: req.userId,
       actorId: req.userId,
       action: 'card_request',
@@ -192,8 +195,6 @@ async function handleCardRequest(req, res) {
       },
       ip: clientIp(req)
     });
-
-    await client.query('COMMIT');
     res.status(201).json({
       id: row.id,
       status: 'pending',
@@ -428,6 +429,7 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
           wallet.id
         ]);
         refunded = units;
+        await client.query('SAVEPOINT card_refund_tx');
         try {
           await client.query(
             `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
@@ -440,7 +442,9 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
               `Card fee refund (rejected ${card.tier || 'card'})`
             ]
           );
+          await client.query('RELEASE SAVEPOINT card_refund_tx');
         } catch (txErr) {
+          await client.query('ROLLBACK TO SAVEPOINT card_refund_tx');
           console.warn('card refund tx skipped', txErr.message);
         }
       }
@@ -448,7 +452,7 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
 
     const updated = await client.query(
       `UPDATE cards SET
-         status = 'rejected',
+         status = 'deactivated',
          fee_paid = false,
          rejected_at = NOW(),
          rejected_by = $2,
@@ -472,8 +476,8 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
       );
     } catch (_) {}
 
+    await safeCommit(client);
     await logUserAudit({
-      client,
       userId: Number(userId),
       actorId: req.userId,
       action: 'card_reject',
@@ -486,8 +490,6 @@ adminRejectRouter.post('/', authenticate, isAdmin, async (req, res) => {
       },
       ip: clientIp(req)
     });
-
-    await client.query('COMMIT');
     res.json({
       success: true,
       card: formatCard(updated.rows[0]),

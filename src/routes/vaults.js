@@ -3,7 +3,7 @@ const pool = require('../db');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { getUsdRates, fromUsd } = require('../services/rates');
 const { normalizeCurrencyKey, ensureWallet } = require('../services/wallets');
-const { logUserAudit, clientIp } = require('../services/audits');
+const { logUserAudit, clientIp, safeCommit } = require('../services/audits');
 
 const router = express.Router();
 
@@ -145,6 +145,7 @@ router.post('/:id/deposit', authenticate, async (req, res) => {
     );
 
     const vaultName = vaultRes.rows[0].name || req.params.id;
+    await client.query('SAVEPOINT vault_dep_tx');
     try {
       await client.query(
         `INSERT INTO transactions (sender_id, receiver_id, currency, amount, amount_usd, type, status, description, created_at, updated_at)
@@ -157,12 +158,14 @@ router.post('/:id/deposit', authenticate, async (req, res) => {
           `Vault deposit: ${vaultName} (${currencyKey.toUpperCase()} → $${amountUsd})`
         ]
       );
+      await client.query('RELEASE SAVEPOINT vault_dep_tx');
     } catch (txErr) {
+      await client.query('ROLLBACK TO SAVEPOINT vault_dep_tx');
       console.warn('vault deposit tx log skipped', txErr.message);
     }
 
+    await safeCommit(client);
     await logUserAudit({
-      client,
       userId: req.userId,
       actorId: req.userId,
       action: 'vault_deposit',
@@ -175,8 +178,6 @@ router.post('/:id/deposit', authenticate, async (req, res) => {
       },
       ip: clientIp(req)
     });
-
-    await client.query('COMMIT');
     res.json({
       success: true,
       vault: formatVault(updated.rows[0]),

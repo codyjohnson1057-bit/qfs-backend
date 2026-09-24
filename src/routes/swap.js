@@ -8,7 +8,7 @@ const {
   findWallet,
   ensureWallet
 } = require('../services/wallets');
-const { logUserAudit, clientIp } = require('../services/audits');
+const { logUserAudit, clientIp, safeCommit } = require('../services/audits');
 
 const router = express.Router();
 
@@ -101,8 +101,8 @@ router.post('/', authenticate, async (req, res) => {
       ]
     );
 
+    await safeCommit(client);
     await logUserAudit({
-      client,
       userId: req.userId,
       actorId: req.userId,
       action: 'swap',
@@ -116,8 +116,6 @@ router.post('/', authenticate, async (req, res) => {
       },
       ip: clientIp(req)
     });
-
-    await client.query('COMMIT');
 
     const wallets = await pool.query(
       'SELECT currency, balance FROM wallets WHERE user_id = $1',
