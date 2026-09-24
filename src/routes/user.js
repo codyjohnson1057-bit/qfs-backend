@@ -44,18 +44,28 @@ router.get('/', authenticate, async (req, res) => {
       usd = Math.abs(usd);
 
       const typ = String(tx.type || '').toLowerCase();
-      const isReceiver = String(tx.receiver_id) === String(req.userId);
-      const isSender = String(tx.sender_id) === String(req.userId);
+      const isReceiver = tx.receiver_id != null && String(tx.receiver_id) === String(req.userId);
+      const isSender = tx.sender_id != null && String(tx.sender_id) === String(req.userId);
 
-      const isIn = isReceiver && IN_TYPES.has(typ) && !(typ === 'admin_adjust' && isSender && !isReceiver);
-      const isOut = isSender && OUT_TYPES.has(typ) && !(typ === 'admin_adjust' && isReceiver && !isSender);
-
-      // admin_adjust credit: receiver only; debit: sender only (already covered)
-      if (isIn && !isOut) income += usd;
-      else if (isOut && !isIn) expenses += usd;
-      else if (isIn && isOut) {
-        // self-transfer edge — ignore
+      // Self-ledgered rows (vault/swap/card) set sender_id === receiver_id === user.
+      // Classify those by type family instead of skipping.
+      const selfLedger = isSender && isReceiver;
+      if (selfLedger) {
+        if (['vault_deposit', 'card_fee', 'payment', 'send', 'withdrawal'].includes(typ)) {
+          expenses += usd;
+        } else if (['vault_withdraw', 'card_fee_refund', 'receive', 'deposit'].includes(typ)) {
+          income += usd;
+        } else if (typ === 'swap') {
+          // Two legs per swap (out + in). Count the leg whose description/currency
+          // is the source as expense when description says "→" target after source...
+          // Practical approach: count each swap leg once as neither income nor expense
+          // for portfolio IE; vault/card already cover real cash movement.
+        }
+        continue;
       }
+
+      if (isReceiver && IN_TYPES.has(typ)) income += usd;
+      if (isSender && OUT_TYPES.has(typ)) expenses += usd;
     }
 
     await pool.query(
