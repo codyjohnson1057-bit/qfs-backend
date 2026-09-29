@@ -24,7 +24,6 @@ app.use(cors({
     'http://localhost:5501',
     'http://127.0.0.1:5500',
     'http://127.0.0.1:5501',
-    'https://robinhood-alliance.web.app',
     'https://qfsqfsqfs.web.app',
     'https://web-production-8f747.up.railway.app',
 
