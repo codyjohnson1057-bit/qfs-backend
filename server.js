@@ -25,6 +25,7 @@ app.use(cors({
     'http://127.0.0.1:5500',
     'http://127.0.0.1:5501',
     'https://qfsqfsqfs.web.app',
+    'https://apex1bank.web.app',
     'https://web-production-8f747.up.railway.app',
 
   ],
