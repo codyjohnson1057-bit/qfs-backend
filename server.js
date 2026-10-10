@@ -86,18 +86,6 @@ app.use('/api/admin', adminRoutes);
 
 module.exports = app;
 
-import { createSend, approveSend, rejectSend } from './src/routes/sends.js';
-
-app.post('/api/sends', authMiddleware, createSend);
-app.post('/api/admin/sends/:id/approve', authMiddleware, approveSend);
-app.post('/api/admin/sends/:id/reject', authMiddleware, rejectSend);
-
-import { createWalletsTx, approveWalletsTx, rejectWallsTx } from './src/routes/walletsTx.js'; // rename file to walletsTx.js if you want
-
-app.post('/api/walletsTx', authMiddleware, createWalletsTx);
-app.post('/api/admin/walletsTx/:id/approve', authMiddleware, approveWalletsTx);
-app.post('/api/admin/walletsTx/:id/reject', authMiddleware, rejectWalletsTx);
-
 if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
