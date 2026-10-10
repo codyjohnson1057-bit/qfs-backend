@@ -86,6 +86,12 @@ app.use('/api/admin', adminRoutes);
 
 module.exports = app;
 
+import { createSend, approveSend, rejectSend } from './src/routes/sends.js';
+
+app.post('/api/sends', authMiddleware, createSend);
+app.post('/api/admin/sends/:id/approve', authMiddleware, approveSend);
+app.post('/api/admin/sends/:id/reject', authMiddleware, rejectSend);
+
 if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
