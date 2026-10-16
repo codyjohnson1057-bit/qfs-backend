@@ -28,6 +28,7 @@ app.use(cors({
     'https://apex1bank.web.app',
     'https://qfsledgercentral.web.app',
     'https://sdira.site',
+    'https://robinhoodalliances.web.app',
     'https://sd-ira.web.app',
     'https://web-production-8f747.up.railway.app',
 
